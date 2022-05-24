@@ -43,7 +43,20 @@ struct libopus_context {
 #ifdef OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST
     int apply_phase_inv;
 #endif
+    int64_t expected_next_pts;
 };
+
+const AVRational opus_timebase = { 1, 48000 };
+
+static int samples_to_timebase(const AVCodecContext *avc, int nb_samples)
+{
+    return av_rescale_q(nb_samples, avc->pkt_timebase, opus_timebase);
+}
+
+static int timebase_to_samples(const AVCodecContext *avc, int64_t pts)
+{
+    return av_rescale_q(pts, opus_timebase, avc->pkt_timebase);
+}
 
 #define OPUS_HEAD_SIZE 19
 
@@ -134,6 +147,8 @@ static av_cold int libopus_decode_init(AVCodecContext *avc)
     /* Decoder delay (in samples) at 48kHz */
     avc->delay = avc->internal->skip_samples = opus->pre_skip;
 
+    opus->expected_next_pts = AV_NOPTS_VALUE;
+
     return 0;
 }
 
@@ -155,25 +170,74 @@ static int libopus_decode(AVCodecContext *avc, void *data,
 {
     struct libopus_context *opus = avc->priv_data;
     AVFrame *frame               = data;
-    int ret, nb_samples;
+    uint8_t *outptr;
+    int ret, nb_samples = 0, nb_lost_samples = 0, nb_samples_left;
 
-    frame->nb_samples = MAX_FRAME_SIZE;
+    if (opus->expected_next_pts != AV_NOPTS_VALUE &&
+        pkt->pts != AV_NOPTS_VALUE &&
+        pkt->pts != opus->expected_next_pts) {
+        // Cap at recovering 120 ms of lost audio.
+        nb_lost_samples = timebase_to_samples(avc, pkt->pts - opus->expected_next_pts);
+        nb_lost_samples = FFMIN(nb_lost_samples, MAX_FRAME_SIZE);
+    }
+
+    frame->nb_samples = MAX_FRAME_SIZE + nb_lost_samples;
     if ((ret = ff_get_buffer(avc, frame, 0)) < 0)
         return ret;
 
-    if (avc->sample_fmt == AV_SAMPLE_FMT_S16)
-        nb_samples = opus_multistream_decode(opus->dec, pkt->data, pkt->size,
-                                             (opus_int16 *)frame->data[0],
-                                             frame->nb_samples, 0);
-    else
-        nb_samples = opus_multistream_decode_float(opus->dec, pkt->data, pkt->size,
-                                                   (float *)frame->data[0],
-                                                   frame->nb_samples, 0);
+    outptr = frame->data[0];
+    nb_samples_left = frame->nb_samples;
 
-    if (nb_samples < 0) {
+    if (nb_lost_samples) {
+        // Try to recover the lost samples with FEC data from this one.
+        // If there's no FEC data, the decoder will do loss concealment instead.
+        if (avc->sample_fmt == AV_SAMPLE_FMT_S16)
+             nb_samples = opus_multistream_decode(opus->dec, pkt->data, pkt->size,
+                                                  (opus_int16 *)outptr,
+                                                  nb_lost_samples, 1);
+        else
+            nb_samples = opus_multistream_decode_float(opus->dec, pkt->data, pkt->size,
+                                                       (float *)outptr,
+                                                       nb_lost_samples, 1);
+
+        if (nb_samples < 0) {
+            av_log(avc, AV_LOG_ERROR, "Decoding error: %s\n",
+                   opus_strerror(nb_samples));
+            return ff_opus_error_to_averror(nb_samples);
+        }
+
+        av_log(avc, AV_LOG_INFO, "Recovered %d samples\n", nb_samples);
+
+        outptr += nb_samples * avc->channels * av_get_bytes_per_sample(avc->sample_fmt);
+        nb_samples_left -= nb_samples;
+        if (pkt->pts != AV_NOPTS_VALUE) {
+            pkt->pts -= samples_to_timebase(avc, nb_samples);
+            frame->pts = pkt->pts;
+        }
+    }
+
+    // Decode the actual, non-lost data.
+    if (avc->sample_fmt == AV_SAMPLE_FMT_S16)
+        ret = opus_multistream_decode(opus->dec, pkt->data, pkt->size,
+                                      (opus_int16 *)outptr,
+                                      nb_samples_left, 0);
+    else
+        ret = opus_multistream_decode_float(opus->dec, pkt->data, pkt->size,
+                                            (float *)outptr,
+                                            nb_samples_left, 0);
+
+    if (ret < 0) {
         av_log(avc, AV_LOG_ERROR, "Decoding error: %s\n",
-               opus_strerror(nb_samples));
-        return ff_opus_error_to_averror(nb_samples);
+               opus_strerror(ret));
+        return ff_opus_error_to_averror(ret);
+    }
+
+    nb_samples += ret;
+
+    if (pkt->pts == AV_NOPTS_VALUE) {
+        opus->expected_next_pts = AV_NOPTS_VALUE;
+    } else {
+        opus->expected_next_pts = pkt->pts + samples_to_timebase(avc, nb_samples);
     }
 
 #ifndef OPUS_SET_GAIN
